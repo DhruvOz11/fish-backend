@@ -1,6 +1,7 @@
 const express = require('express')
 const router = express.Router()
 const jwt = require('jsonwebtoken')
+const mongoose = require('mongoose')
 const Order = require('../models/Order')
 const Customer = require('../models/Customer')
 const Coupon = require('../models/Coupon')
@@ -8,6 +9,13 @@ const Settings = require('../models/Settings')
 const { notifyNewOrder, notifyCustomerStatus } = require('../services/whatsapp')
 const adminAuth = require('../middleware/auth')
 const { orderLimiter } = require('../middleware/rateLimit')
+
+function findOrder(id) {
+  if (mongoose.Types.ObjectId.isValid(id)) {
+    return Order.findById(id).then((o) => o || Order.findOne({ orderId: id }))
+  }
+  return Order.findOne({ orderId: id })
+}
 
 function optionalCustomerAuth(req, res, next) {
   const h = req.headers.authorization
@@ -22,7 +30,7 @@ function optionalCustomerAuth(req, res, next) {
   next()
 }
 
-// ── POST /api/orders — place order (public + optional auth) ───────
+// ── POST /api/orders — place order ───────────────────────────────
 router.post('/', orderLimiter, optionalCustomerAuth, async (req, res) => {
   try {
     const {
@@ -33,44 +41,70 @@ router.post('/', orderLimiter, optionalCustomerAuth, async (req, res) => {
       pincode,
       city,
       items,
-      deliveryType,
       couponCode,
       paymentMethod,
-      deliverySlot,
     } = req.body
 
-    // Basic validation
-    if (
-      !customerName ||
-      !customerPhone ||
-      !address ||
-      !pincode ||
-      !items?.length
-    ) {
+    // Validate required fields
+    if (!customerName?.trim())
       return res
         .status(400)
-        .json({ success: false, message: 'Missing required order fields' })
-    }
+        .json({ success: false, message: 'Customer name is required' })
+    if (!customerPhone?.trim())
+      return res
+        .status(400)
+        .json({ success: false, message: 'Phone number is required' })
+    if (!address?.trim())
+      return res
+        .status(400)
+        .json({ success: false, message: 'Delivery address is required' })
+    if (!pincode?.trim())
+      return res
+        .status(400)
+        .json({ success: false, message: 'Pincode is required' })
+    if (!/^\d{6}$/.test(pincode.trim()))
+      return res
+        .status(400)
+        .json({ success: false, message: 'Invalid pincode — must be 6 digits' })
+    if (!items?.length)
+      return res
+        .status(400)
+        .json({ success: false, message: 'Order must have at least one item' })
 
     const settings = await Settings.getSettings()
-    const itemTotal = items.reduce((s, i) => s + i.price * i.quantity, 0)
+    if (!settings.storeOpen)
+      return res
+        .status(400)
+        .json({
+          success: false,
+          message: settings.storeClosedMessage || 'Store is currently closed',
+        })
 
-    // Delivery fee logic
-    const feeMap = {
-      standard: settings.standardDeliveryFee,
-      express: settings.expressDeliveryFee,
-      scheduled: settings.scheduledDeliveryFee,
-    }
-    let deliveryFee = feeMap[deliveryType] ?? settings.standardDeliveryFee
-    if (
+    const itemTotal = items.reduce(
+      (s, i) => s + Number(i.price) * Number(i.quantity),
+      0,
+    )
+    if (itemTotal <= 0)
+      return res
+        .status(400)
+        .json({ success: false, message: 'Invalid order total' })
+    if (settings.minOrderAmount > 0 && itemTotal < settings.minOrderAmount)
+      return res
+        .status(400)
+        .json({
+          success: false,
+          message: `Minimum order amount is ₹${settings.minOrderAmount}`,
+        })
+
+    // Delivery fee = 0 initially, admin sets it on confirmation
+    const deliveryFee =
       settings.freeDeliveryThreshold > 0 &&
       itemTotal >= settings.freeDeliveryThreshold
-    )
-      deliveryFee = 0
+        ? 0
+        : settings.standardDeliveryFee
 
-    // Coupon logic
-    let discount = 0
-    let resolvedCouponCode = ''
+    let discount = 0,
+      resolvedCoupon = ''
     if (couponCode) {
       const coupon = await Coupon.findOne({
         code: couponCode.toUpperCase(),
@@ -79,83 +113,89 @@ router.post('/', orderLimiter, optionalCustomerAuth, async (req, res) => {
       if (!coupon)
         return res
           .status(400)
-          .json({ success: false, message: 'Invalid or expired coupon' })
+          .json({ success: false, message: 'Invalid coupon code' })
       if (coupon.expiresAt && coupon.expiresAt < new Date())
         return res
           .status(400)
-          .json({ success: false, message: 'Coupon expired' })
+          .json({ success: false, message: 'Coupon has expired' })
       if (coupon.minOrder && itemTotal < coupon.minOrder)
         return res
           .status(400)
           .json({
             success: false,
-            message: `Min order ₹${coupon.minOrder} for this coupon`,
+            message: `Minimum order ₹${coupon.minOrder} required for this coupon`,
           })
       if (coupon.maxUses > 0 && coupon.usedCount >= coupon.maxUses)
         return res
           .status(400)
           .json({ success: false, message: 'Coupon usage limit reached' })
-
-      if (coupon.type === 'percentage') {
-        discount = Math.round((itemTotal * coupon.discount) / 100)
-        if (coupon.maxDiscount > 0)
-          discount = Math.min(discount, coupon.maxDiscount)
-      } else {
-        discount = coupon.discount
-      }
-      resolvedCouponCode = coupon.code
+      discount =
+        coupon.type === 'percentage'
+          ? Math.min(
+              Math.round((itemTotal * coupon.discount) / 100),
+              coupon.maxDiscount > 0 ? coupon.maxDiscount : Infinity,
+            )
+          : coupon.discount
+      resolvedCoupon = coupon.code
       await Coupon.findByIdAndUpdate(coupon._id, { $inc: { usedCount: 1 } })
     }
 
     const totalAmount = Math.max(0, itemTotal + deliveryFee - discount)
 
     const order = await Order.create({
-      customerName,
-      customerPhone,
-      address,
-      landmark: landmark || '',
-      pincode,
-      city: city || '',
-      items,
+      customerName: customerName.trim(),
+      customerPhone: customerPhone.trim(),
+      address: address.trim(),
+      landmark: (landmark || '').trim(),
+      pincode: pincode.trim(),
+      city: (city || '').trim(),
+      items: items.map((i) => ({
+        ...i,
+        price: Number(i.price),
+        quantity: Number(i.quantity),
+      })),
       itemTotal,
       deliveryFee,
       discount,
-      couponCode: resolvedCouponCode,
+      couponCode: resolvedCoupon,
       totalAmount,
-      deliveryType: deliveryType || 'standard',
-      deliverySlot: deliverySlot || 'Tomorrow 6AM - 8AM',
+      deliveryType: 'standard',
+      deliverySlot: 'Within 2 hours of confirmation',
       paymentMethod: paymentMethod || 'COD',
       customer: req.customer?.customerId || null,
-      statusHistory: [{ status: 'pending', note: 'Order placed' }],
+      statusHistory: [{ status: 'pending', note: 'Order placed by customer' }],
     })
 
-    // Update customer stats
     if (req.customer?.customerId) {
       await Customer.findByIdAndUpdate(req.customer.customerId, {
         $inc: { totalOrders: 1, totalSpent: totalAmount },
       })
     }
 
-    // Fire and forget — don't await so order response is instant
     notifyNewOrder(order).catch(console.error)
-
     res
       .status(201)
       .json({
         success: true,
-        data: { orderId: order.orderId, totalAmount, _id: order._id },
-        message: 'Order placed successfully!',
+        data: { orderId: order.orderId, _id: order._id, totalAmount },
+        message: 'Order placed! We will confirm on WhatsApp shortly.',
       })
   } catch (err) {
-    res.status(500).json({ success: false, message: err.message })
+    console.error('Order error:', err)
+    res
+      .status(500)
+      .json({
+        success: false,
+        message: 'Failed to place order. Please try again.',
+      })
   }
 })
 
-// ── GET /api/orders/mine — customer's own orders ──────────────────
+// ── GET /api/orders/mine ─────────────────────────────────────────
 router.get('/mine', async (req, res) => {
-  const h = req.headers.authorization
-  const phone = req.query.phone
   try {
+    const h = req.headers.authorization
+    const phone = req.query.phone
     let filter = {}
     if (h?.startsWith('Bearer ')) {
       try {
@@ -165,16 +205,15 @@ router.get('/mine', async (req, res) => {
         )
         filter.customer = d.customerId
       } catch {}
-    } else if (phone) {
+    }
+    if (!filter.customer && phone) {
       filter.customerPhone = {
-        $regex: phone.replace(/[^0-9]/g, ''),
+        $regex: phone.replace(/[^0-9]/g, '').slice(-10),
         $options: 'i',
       }
-    } else {
-      return res
-        .status(400)
-        .json({ success: false, message: 'Authentication required' })
     }
+    if (!filter.customer && !filter.customerPhone)
+      return res.status(400).json({ success: false, message: 'Auth required' })
     const orders = await Order.find(filter).sort({ createdAt: -1 }).limit(20)
     res.json({ success: true, data: orders })
   } catch (err) {
@@ -182,7 +221,7 @@ router.get('/mine', async (req, res) => {
   }
 })
 
-// ── GET /api/orders — admin: list all orders ──────────────────────
+// ── GET /api/orders — admin list ─────────────────────────────────
 router.get('/', adminAuth, async (req, res) => {
   try {
     const { status, page = 1, limit = 20, search, from, to } = req.query
@@ -211,7 +250,6 @@ router.get('/', adminAuth, async (req, res) => {
       success: true,
       data: orders,
       total,
-      page: Number(page),
       pages: Math.ceil(total / Number(limit)),
     })
   } catch (err) {
@@ -219,15 +257,10 @@ router.get('/', adminAuth, async (req, res) => {
   }
 })
 
-// ── GET /api/orders/:id — admin or customer ───────────────────────
+// ── GET /api/orders/:id ──────────────────────────────────────────
 router.get('/:id', async (req, res) => {
   try {
-    const order = await Order.findOne({
-      $or: [
-        { _id: req.params.id.match(/^[a-f\d]{24}$/i) ? req.params.id : null },
-        { orderId: req.params.id },
-      ],
-    })
+    const order = await findOrder(req.params.id)
     if (!order)
       return res
         .status(404)
@@ -238,11 +271,12 @@ router.get('/:id', async (req, res) => {
   }
 })
 
-// ── PATCH /api/orders/:id/status — admin update status ───────────
+// ── PATCH /api/orders/:id/status — admin ─────────────────────────
+// When status = confirmed, admin sets delivery fee and full invoice sent to customer
 router.patch('/:id/status', adminAuth, async (req, res) => {
   try {
-    const { status, note, cancelReason } = req.body
-    const validStatuses = [
+    const { status, note, cancelReason, deliveryFee } = req.body
+    const valid = [
       'pending',
       'confirmed',
       'preparing',
@@ -250,10 +284,10 @@ router.patch('/:id/status', adminAuth, async (req, res) => {
       'delivered',
       'cancelled',
     ]
-    if (!validStatuses.includes(status))
+    if (!valid.includes(status))
       return res.status(400).json({ success: false, message: 'Invalid status' })
 
-    const order = await Order.findById(req.params.id)
+    const order = await findOrder(req.params.id)
     if (!order)
       return res
         .status(404)
@@ -261,30 +295,74 @@ router.patch('/:id/status', adminAuth, async (req, res) => {
 
     order.status = status
     if (cancelReason) order.cancelReason = cancelReason
-    order.statusHistory.push({ status, note: note || '' })
+
+    // Admin sets delivery fee on confirmation
+    if (
+      status === 'confirmed' &&
+      deliveryFee !== undefined &&
+      deliveryFee !== null
+    ) {
+      const fee = parseFloat(deliveryFee)
+      if (!isNaN(fee) && fee >= 0) {
+        order.deliveryFee = fee
+        order.totalAmount = Math.max(0, order.itemTotal + fee - order.discount)
+      }
+    }
+
+    order.statusHistory.push({
+      status,
+      note: note || '',
+      updatedAt: new Date(),
+    })
     await order.save()
 
-    // Notify customer
+    // Send WhatsApp notification — confirmed sends full invoice
     notifyCustomerStatus(order).catch(console.error)
 
+    res.json({ success: true, data: order, message: `Order ${status}` })
+  } catch (err) {
+    console.error('Status update error:', err)
+    res.status(500).json({ success: false, message: err.message })
+  }
+})
+
+// ── GET /api/orders/:id/invoice — generate invoice data ──────────
+router.get('/:id/invoice', async (req, res) => {
+  try {
+    const order = await findOrder(req.params.id)
+    if (!order)
+      return res
+        .status(404)
+        .json({ success: false, message: 'Order not found' })
     res.json({
       success: true,
-      data: order,
-      message: `Order status updated to ${status}`,
+      data: {
+        orderId: order.orderId,
+        date: order.createdAt,
+        customerName: order.customerName,
+        customerPhone: order.customerPhone,
+        address: `${order.address}${order.landmark ? ', ' + order.landmark : ''}, ${order.pincode}`,
+        items: order.items,
+        itemTotal: order.itemTotal,
+        deliveryFee: order.deliveryFee,
+        discount: order.discount,
+        couponCode: order.couponCode,
+        totalAmount: order.totalAmount,
+        paymentMethod: order.paymentMethod,
+        status: order.status,
+      },
     })
   } catch (err) {
     res.status(500).json({ success: false, message: err.message })
   }
 })
 
-// ── GET /api/orders/:id/validate-coupon — validate before placing ─
+// ── POST /api/orders/validate-coupon ────────────────────────────
 router.post('/validate-coupon', async (req, res) => {
   try {
     const { code, cartTotal } = req.body
     if (!code)
-      return res
-        .status(400)
-        .json({ success: false, message: 'Coupon code required' })
+      return res.status(400).json({ success: false, message: 'Code required' })
     const coupon = await Coupon.findOne({
       code: code.toUpperCase(),
       isActive: true,
@@ -294,9 +372,7 @@ router.post('/validate-coupon', async (req, res) => {
         .status(400)
         .json({ success: false, message: 'Invalid coupon code' })
     if (coupon.expiresAt && coupon.expiresAt < new Date())
-      return res
-        .status(400)
-        .json({ success: false, message: 'Coupon has expired' })
+      return res.status(400).json({ success: false, message: 'Coupon expired' })
     if (coupon.minOrder && cartTotal < coupon.minOrder)
       return res
         .status(400)
@@ -307,8 +383,8 @@ router.post('/validate-coupon', async (req, res) => {
     if (coupon.maxUses > 0 && coupon.usedCount >= coupon.maxUses)
       return res
         .status(400)
-        .json({ success: false, message: 'Coupon usage limit reached' })
-    let discount =
+        .json({ success: false, message: 'Usage limit reached' })
+    const discount =
       coupon.type === 'percentage'
         ? Math.min(
             Math.round((cartTotal * coupon.discount) / 100),

@@ -67,7 +67,7 @@ async function sendWhatsAppMessage(to, message) {
 async function sendOTP(phone, otp) {
   return sendWhatsAppMessage(
     phone,
-    `🐟 *FreshCatch*\n\nYour login OTP is: *${otp}*\n\nValid for 10 minutes. Do not share this with anyone.`,
+    `🐟 *The Fish Merchant*\n\nYour OTP is: *${otp}*\n\nValid for 10 minutes. Do not share this with anyone.\n\n_Team The Fish Merchant_`,
   )
 }
 
@@ -79,21 +79,62 @@ async function notifyNewOrder(order) {
     .join('\n')
   return sendWhatsAppMessage(
     biz,
-    `🆕 *New Order — ${order.orderId}*\n\n👤 ${order.customerName}\n📞 ${order.customerPhone}\n📍 ${order.address}, ${order.pincode}\n\n📦 *Items:*\n${items}\n\n💰 Items: ₹${order.itemTotal}\n*Total: ₹${order.totalAmount}*\n💵 ${order.paymentMethod}`,
+    `🆕 *New Order — ${order.orderId}*\n\n👤 ${order.customerName}\n📞 ${order.customerPhone}\n📍 ${order.address}${order.landmark ? ', ' + order.landmark : ''}, ${order.pincode}\n\n📦 *Items:*\n${items}\n\n💰 Item Total: ₹${order.itemTotal}\n${order.discount > 0 ? `🎟 Discount: -₹${order.discount}\n` : ''}*Customer Total: ₹${order.totalAmount}*\n\n💵 Payment: ${order.paymentMethod}\n⚠️ Delivery charge to be set when confirming`,
   )
 }
 
+// Full invoice confirmation message sent to customer
+async function sendOrderConfirmation(order) {
+  if (!order.customerPhone) return
+  const items = order.items
+    .map((i) => `  • ${i.name} × ${i.quantity}  →  ₹${i.price * i.quantity}`)
+    .join('\n')
+  const invoiceLines = [
+    `🧾 *INVOICE — The Fish Merchant*`,
+    `Order ID: *${order.orderId}*`,
+    `Date: ${new Date(order.createdAt || Date.now()).toLocaleDateString('en-IN', { day: 'numeric', month: 'short', year: 'numeric' })}`,
+    ``,
+    `📦 *Items Ordered*`,
+    items,
+    ``,
+    `💰 *Bill Summary*`,
+    `Item Total:    ₹${order.itemTotal}`,
+    `Delivery Fee:  ₹${order.deliveryFee}`,
+    ...(order.discount > 0 ? [`Discount:      -₹${order.discount}`] : []),
+    `*Amount to Pay: ₹${order.totalAmount}*`,
+    ``,
+    `📍 *Delivery Address*`,
+    `${order.address}${order.landmark ? ', Near: ' + order.landmark : ''}, ${order.pincode}`,
+    ``,
+    `✅ *Your order is confirmed!*`,
+    `🚚 Delivery within 2 hours.`,
+    `💵 Payment: ${order.paymentMethod}`,
+    ``,
+    `Track your order: Reply *STATUS* to this message`,
+    `Issues? Reply *HELP*`,
+    ``,
+    `Thank you for choosing The Fish Merchant! 🐟`,
+  ].join('\n')
+  return sendWhatsAppMessage(order.customerPhone, invoiceLines)
+}
+
 async function notifyCustomerStatus(order) {
+  // For confirmed orders, send full invoice instead of simple message
+  if (order.status === 'confirmed') {
+    return sendOrderConfirmation(order)
+  }
   const msgs = {
-    confirmed: `✅ Your order *${order.orderId}* has been confirmed! We'll prepare your fresh catch soon.`,
     preparing: `🔪 Your order *${order.orderId}* is being cleaned & packed fresh.`,
-    out_for_delivery: `🚚 Your order *${order.orderId}* is on the way to you!`,
-    delivered: `🐟 Order *${order.orderId}* delivered! Enjoy your meal! Thank you for choosing FreshCatch 😊`,
-    cancelled: `❌ Order *${order.orderId}* cancelled.${order.cancelReason ? ' Reason: ' + order.cancelReason : ''}`,
+    out_for_delivery: `🚚 Your order *${order.orderId}* is on the way! Delivered within 2 hours of confirmation.`,
+    delivered: `✅ Order *${order.orderId}* delivered! Enjoy your meal!\n\nRate your experience or report an issue by replying to this message.\n\nThank you for choosing *The Fish Merchant* 🐟`,
+    cancelled: `❌ Order *${order.orderId}* has been cancelled.${order.cancelReason ? '\nReason: ' + order.cancelReason : ''}\n\nFor refund queries, reply to this message.`,
   }
   const msg = msgs[order.status]
   if (!msg || !order.customerPhone) return
-  return sendWhatsAppMessage(order.customerPhone, `🐟 *FreshCatch*\n\n${msg}`)
+  return sendWhatsAppMessage(
+    order.customerPhone,
+    `🐟 *The Fish Merchant*\n\n${msg}`,
+  )
 }
 
 module.exports = {
@@ -101,4 +142,5 @@ module.exports = {
   notifyNewOrder,
   notifyCustomerStatus,
   sendWhatsAppMessage,
+  sendOrderConfirmation,
 }
