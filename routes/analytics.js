@@ -293,7 +293,7 @@ router.get('/category-breakdown', adminAuth, async (req, res) => {
           as: 'product',
         },
       },
-      { $unwind: { path: '$product', preserveNullAndEmpty: true } },
+      { $unwind: { path: '$product', preserveNullAndEmptyArrays: true } },
       {
         $group: {
           _id: { $ifNull: ['$product.category', 'unknown'] },

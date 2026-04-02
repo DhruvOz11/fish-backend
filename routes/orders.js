@@ -407,3 +407,35 @@ router.post('/validate-coupon', async (req, res) => {
 })
 
 module.exports = router
+
+// ── GET /api/orders/:id/invoice/pdf — download invoice PDF ───────
+router.get('/:id/invoice/pdf', async (req, res) => {
+  try {
+    const order = await findOrder(req.params.id)
+    if (!order)
+      return res
+        .status(404)
+        .json({ success: false, message: 'Order not found' })
+
+    const { generateInvoicePDF } = require('../services/whatsapp')
+    const pdfBuffer = await generateInvoicePDF(order)
+
+    if (!pdfBuffer) {
+      return res
+        .status(503)
+        .json({
+          success: false,
+          message: 'PDF generation requires pdfkit. Run: npm install pdfkit',
+        })
+    }
+
+    res.setHeader('Content-Type', 'application/pdf')
+    res.setHeader(
+      'Content-Disposition',
+      `attachment; filename="Invoice-${order.orderId}.pdf"`,
+    )
+    res.send(pdfBuffer)
+  } catch (err) {
+    res.status(500).json({ success: false, message: err.message })
+  }
+})
