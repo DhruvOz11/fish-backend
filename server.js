@@ -49,6 +49,7 @@ safeRoute('/api/coupons', './routes/coupons')
 safeRoute('/api/settings', './routes/settings')
 safeRoute('/api/analytics', './routes/analytics')
 safeRoute('/api/issues', './routes/issues')
+safeRoute('/api/onboarding', './routes/onboarding')
 safeRoute('/api/hero', './routes/heroBanners')
 
 // Health check
