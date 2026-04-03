@@ -197,6 +197,8 @@ router.get('/mine', async (req, res) => {
     const h = req.headers.authorization
     const phone = req.query.phone
     let filter = {}
+
+    // Try JWT first
     if (h?.startsWith('Bearer ')) {
       try {
         const d = jwt.verify(
@@ -206,14 +208,26 @@ router.get('/mine', async (req, res) => {
         filter.customer = d.customerId
       } catch {}
     }
+
+    // Phone param always accepted (used by fake OTP login)
     if (!filter.customer && phone) {
-      filter.customerPhone = {
-        $regex: phone.replace(/[^0-9]/g, '').slice(-10),
-        $options: 'i',
+      const digits = phone.replace(/[^0-9]/g, '')
+      const last10 = digits.slice(-10)
+      if (last10.length === 10) {
+        // Match against stored phone (which may be 91XXXXXXXXXX or +91 XXXXXXXXXX)
+        filter.customerPhone = { $regex: last10, $options: 'i' }
       }
     }
-    if (!filter.customer && !filter.customerPhone)
-      return res.status(400).json({ success: false, message: 'Auth required' })
+
+    if (!filter.customer && !filter.customerPhone) {
+      return res
+        .status(400)
+        .json({
+          success: false,
+          message: 'Phone number required to view orders',
+        })
+    }
+
     const orders = await Order.find(filter).sort({ createdAt: -1 }).limit(20)
     res.json({ success: true, data: orders })
   } catch (err) {

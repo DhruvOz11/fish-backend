@@ -338,3 +338,83 @@ router.get('/test-whatsapp', adminAuth, async (req, res) => {
 })
 
 module.exports = router
+
+// ── POST /api/customers/manual — admin adds/updates customer ──────
+router.post('/manual', adminAuth, async (req, res) => {
+  try {
+    const { name, phone, address, pincode, city } = req.body
+    if (!phone)
+      return res
+        .status(400)
+        .json({ success: false, message: 'Phone number required' })
+
+    // Normalize phone
+    const digits = phone.replace(/[^0-9]/g, '')
+    let normalized = digits
+    if (digits.length === 10) normalized = '91' + digits
+    else if (digits.length === 12 && digits.startsWith('91'))
+      normalized = digits
+    else
+      return res
+        .status(400)
+        .json({
+          success: false,
+          message: 'Invalid phone — enter 10-digit Indian number',
+        })
+
+    // Upsert: if phone exists update name, else create
+    let customer = await Customer.findOne({ phone: normalized })
+    let isNew = false
+
+    if (customer) {
+      // Update name if provided
+      if (name && name.trim()) customer.name = name.trim()
+      // Add address if provided
+      if (address && pincode) {
+        const exists = customer.addresses.some(
+          (a) => a.address === address.trim(),
+        )
+        if (!exists) {
+          customer.addresses.push({
+            label: 'Home',
+            address: address.trim(),
+            pincode: pincode.trim(),
+            city: city || '',
+            isDefault: customer.addresses.length === 0,
+          })
+        }
+      }
+      await customer.save()
+    } else {
+      isNew = true
+      const newData = {
+        phone: normalized,
+        name: name?.trim() || '',
+        lastLogin: null,
+      }
+      if (address && pincode) {
+        newData.addresses = [
+          {
+            label: 'Home',
+            address: address.trim(),
+            pincode: pincode.trim(),
+            city: city || '',
+            isDefault: true,
+          },
+        ]
+      }
+      customer = await Customer.create(newData)
+    }
+
+    res.status(isNew ? 201 : 200).json({
+      success: true,
+      data: customer,
+      message: isNew
+        ? 'Customer added successfully'
+        : 'Customer updated successfully',
+      action: isNew ? 'created' : 'updated',
+    })
+  } catch (err) {
+    res.status(500).json({ success: false, message: err.message })
+  }
+})
