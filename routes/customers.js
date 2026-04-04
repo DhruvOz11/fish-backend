@@ -1,23 +1,26 @@
 const express = require('express')
 const router = express.Router()
 const jwt = require('jsonwebtoken')
+const mongoose = require('mongoose')
 const Customer = require('../models/Customer')
+const Order = require('../models/Order')
 const OTP = require('../models/OTP')
 const { sendOTP, sendWhatsAppMessage } = require('../services/whatsapp')
 const { otpLimiter, otpVerifyLimiter } = require('../middleware/rateLimit')
 const adminAuth = require('../middleware/auth')
 
+// ── Normalize phone to "91XXXXXXXXXX" format ────────────────────
 function normalizePhone(phone) {
-  const digits = String(phone).replace(/[^0-9]/g, '')
-  if (digits.length === 10) return '91' + digits
-  if (digits.length === 12 && digits.startsWith('91')) return digits
+  const d = String(phone || '').replace(/[^0-9]/g, '')
+  if (d.length === 10) return '91' + d
+  if (d.length === 12 && d.startsWith('91')) return d
   return null
 }
-
 function generateOTP() {
-  return Math.floor(100000 + Math.random() * 900000).toString()
+  return String(Math.floor(1000 + Math.random() * 9000))
 }
 
+// ── Customer JWT middleware ──────────────────────────────────────
 function customerAuth(req, res, next) {
   const h = req.headers.authorization
   if (!h?.startsWith('Bearer '))
@@ -44,60 +47,30 @@ function customerAuth(req, res, next) {
 router.post('/send-otp', otpLimiter, async (req, res) => {
   const { phone } = req.body
   if (!phone)
-    return res
-      .status(400)
-      .json({ success: false, message: 'Phone number required' })
-
+    return res.status(400).json({ success: false, message: 'Phone required' })
   const normalized = normalizePhone(phone)
   if (!normalized)
     return res
       .status(400)
-      .json({
-        success: false,
-        message: 'Invalid phone number. Use 10-digit Indian mobile number.',
-      })
-
+      .json({ success: false, message: 'Invalid phone number' })
   try {
     await OTP.deleteMany({ phone: normalized })
     const otp = generateOTP()
     await OTP.create({ phone: normalized, otp })
-
-    // Send OTP via WhatsApp (logs to console if credentials not set)
-    const waResult = await sendOTP(normalized, otp)
-
+    await sendOTP(normalized, otp)
+    console.log('[OTP] Phone:', normalized, '| Code:', otp)
     const isDev = process.env.NODE_ENV !== 'production'
-    const waConfigured =
-      !!process.env.WHATSAPP_PHONE_NUMBER_ID &&
-      !!process.env.WHATSAPP_ACCESS_TOKEN
-
-    // Always log OTP to server console for easy debugging
-    console.log(`\n🔑 OTP for ${normalized}: ${otp}\n`)
-
+    const waSet = !!(
+      process.env.WHATSAPP_PHONE_NUMBER_ID && process.env.WHATSAPP_ACCESS_TOKEN
+    )
     res.json({
       success: true,
-      message: waConfigured
-        ? 'OTP sent to your WhatsApp number'
-        : 'OTP generated (WhatsApp not configured — check server console)',
       phone: normalized,
-      whatsappSent: waResult.success,
-      // Return OTP in non-production OR if WhatsApp not configured
-      ...(!waConfigured || isDev
-        ? {
-            otp,
-            note: waConfigured
-              ? 'Dev mode: OTP shown in response'
-              : 'WhatsApp not configured — use this OTP for testing',
-          }
-        : {}),
+      message: 'OTP sent',
+      ...(!waSet || isDev ? { otp } : {}),
     })
   } catch (err) {
-    console.error('[OTP] Error:', err)
-    res
-      .status(500)
-      .json({
-        success: false,
-        message: 'Failed to generate OTP: ' + err.message,
-      })
+    res.status(500).json({ success: false, message: err.message })
   }
 })
 
@@ -110,10 +83,7 @@ router.post('/verify-otp', otpVerifyLimiter, async (req, res) => {
       .json({ success: false, message: 'Phone and OTP required' })
   const normalized = normalizePhone(phone)
   if (!normalized)
-    return res
-      .status(400)
-      .json({ success: false, message: 'Invalid phone number' })
-
+    return res.status(400).json({ success: false, message: 'Invalid phone' })
   try {
     const record = await OTP.findOne({
       phone: normalized,
@@ -122,54 +92,43 @@ router.post('/verify-otp', otpVerifyLimiter, async (req, res) => {
     if (!record)
       return res
         .status(400)
-        .json({
-          success: false,
-          message: 'OTP expired or not found. Please request a new one.',
-        })
-
+        .json({ success: false, message: 'OTP expired. Request a new one.' })
     if (record.attempts >= 5) {
       await OTP.deleteOne({ _id: record._id })
       return res
         .status(400)
         .json({
           success: false,
-          message: 'Too many wrong attempts. Please request a new OTP.',
+          message: 'Too many attempts. Request new OTP.',
         })
     }
-
     if (record.otp !== String(otp)) {
       await OTP.findByIdAndUpdate(record._id, { $inc: { attempts: 1 } })
-      const left = 4 - record.attempts
       return res
         .status(400)
         .json({
           success: false,
-          message: `Wrong OTP. ${left} attempt${left !== 1 ? 's' : ''} left.`,
+          message: 'Wrong OTP. ' + (4 - record.attempts) + ' attempts left.',
         })
     }
-
     await OTP.findByIdAndUpdate(record._id, { verified: true })
-
     let customer = await Customer.findOne({ phone: normalized })
-    if (!customer) {
+    if (!customer)
       customer = await Customer.create({
         phone: normalized,
         name: name || '',
         lastLogin: new Date(),
       })
-    } else {
+    else {
       customer.lastLogin = new Date()
       if (name && !customer.name) customer.name = name
       await customer.save()
     }
-
-    // 10-year token = effectively permanent (re-login only needed on new device)
     const token = jwt.sign(
       { customerId: customer._id, phone: customer.phone },
       process.env.JWT_CUSTOMER_SECRET || process.env.JWT_SECRET,
       { expiresIn: '3650d' },
     )
-
     res.json({
       success: true,
       token,
@@ -181,7 +140,6 @@ router.post('/verify-otp', otpVerifyLimiter, async (req, res) => {
       },
     })
   } catch (err) {
-    console.error('[Verify OTP] Error:', err)
     res.status(500).json({ success: false, message: err.message })
   }
 })
@@ -189,7 +147,7 @@ router.post('/verify-otp', otpVerifyLimiter, async (req, res) => {
 // ── GET /api/customers/me ────────────────────────────────────────
 router.get('/me', customerAuth, async (req, res) => {
   try {
-    const c = await Customer.findById(req.customer.customerId).select('-__v')
+    const c = await Customer.findById(req.customer.customerId)
     if (!c)
       return res.status(404).json({ success: false, message: 'Not found' })
     res.json({ success: true, data: c })
@@ -237,24 +195,10 @@ router.post('/addresses', customerAuth, async (req, res) => {
   }
 })
 
-// ── DELETE /api/customers/addresses/:id ─────────────────────────
-router.delete('/addresses/:addrId', customerAuth, async (req, res) => {
-  try {
-    const c = await Customer.findById(req.customer.customerId)
-    c.addresses = c.addresses.filter(
-      (a) => a._id.toString() !== req.params.addrId,
-    )
-    await c.save()
-    res.json({ success: true, data: c.addresses })
-  } catch (err) {
-    res.status(500).json({ success: false, message: err.message })
-  }
-})
-
-// ── GET /api/customers — admin list ─────────────────────────────
+// ── GET /api/customers — admin list with stats ───────────────────
 router.get('/', adminAuth, async (req, res) => {
   try {
-    const { page = 1, limit = 30, search, sort = 'newest' } = req.query
+    const { page = 1, limit = 30, search, sort = 'newest', period } = req.query
     const filter = {}
     if (search)
       filter.$or = [
@@ -270,6 +214,7 @@ router.get('/', adminAuth, async (req, res) => {
     const skip = (Number(page) - 1) * Number(limit)
     const monthAgo = new Date()
     monthAgo.setMonth(monthAgo.getMonth() - 1)
+
     const [customers, total, repeatCount, newThisMonth] = await Promise.all([
       Customer.find(filter)
         .sort(sortMap[sort] || { createdAt: -1 })
@@ -286,6 +231,131 @@ router.get('/', adminAuth, async (req, res) => {
       repeatCount,
       newThisMonth,
     })
+  } catch (err) {
+    res.status(500).json({ success: false, message: err.message })
+  }
+})
+
+// ── GET /api/customers/:id — admin: full customer detail ─────────
+router.get('/:id', adminAuth, async (req, res) => {
+  try {
+    const id = req.params.id
+    let customer
+    if (mongoose.Types.ObjectId.isValid(id)) {
+      customer = await Customer.findById(id)
+    }
+    if (!customer) {
+      // Try by phone
+      const norm = normalizePhone(id)
+      if (norm) customer = await Customer.findOne({ phone: norm })
+    }
+    if (!customer)
+      return res
+        .status(404)
+        .json({ success: false, message: 'Customer not found' })
+
+    // Get all orders by this customer's phone
+    const phoneDigits = customer.phone.replace(/[^0-9]/g, '').slice(-10)
+    const orders = await Order.find({
+      $or: [
+        { customer: customer._id },
+        { customerPhone: { $regex: phoneDigits, $options: 'i' } },
+      ],
+    }).sort({ createdAt: -1 })
+
+    // Compute lifetime stats from actual orders
+    const totalOrders = orders.length
+    const totalSpent = orders
+      .filter((o) => o.status !== 'cancelled')
+      .reduce((s, o) => s + (o.totalAmount || 0), 0)
+
+    res.json({
+      success: true,
+      data: { ...customer.toObject(), totalOrders, totalSpent },
+      orders,
+    })
+  } catch (err) {
+    res.status(500).json({ success: false, message: err.message })
+  }
+})
+
+// ── POST /api/customers/manual — admin add/update by phone ───────
+router.post('/manual', adminAuth, async (req, res) => {
+  try {
+    const { name, phone, address, pincode, city, landmark } = req.body
+    if (!phone)
+      return res.status(400).json({ success: false, message: 'Phone required' })
+    const normalized = normalizePhone(phone)
+    if (!normalized)
+      return res
+        .status(400)
+        .json({ success: false, message: 'Invalid phone number' })
+
+    let customer = await Customer.findOne({ phone: normalized })
+    let isNew = false
+
+    if (customer) {
+      if (name?.trim()) customer.name = name.trim()
+      if (address && pincode) {
+        const dup = customer.addresses.some(
+          (a) => a.pincode === pincode.trim() && a.address === address.trim(),
+        )
+        if (!dup)
+          customer.addresses.push({
+            label: 'Home',
+            address: address.trim(),
+            landmark: landmark || '',
+            pincode: pincode.trim(),
+            city: city || '',
+            isDefault: customer.addresses.length === 0,
+          })
+      }
+      await customer.save()
+    } else {
+      isNew = true
+      const data = { phone: normalized, name: name?.trim() || '' }
+      if (address && pincode)
+        data.addresses = [
+          {
+            label: 'Home',
+            address: address.trim(),
+            landmark: landmark || '',
+            pincode: pincode.trim(),
+            city: city || '',
+            isDefault: true,
+          },
+        ]
+      customer = await Customer.create(data)
+    }
+
+    // Also link any existing orders by phone
+    const phoneDigits = normalized.slice(-10)
+    await Order.updateMany(
+      { customerPhone: { $regex: phoneDigits, $options: 'i' }, customer: null },
+      { $set: { customer: customer._id } },
+    )
+
+    // Recompute order stats
+    const orders = await Order.find({
+      $or: [
+        { customer: customer._id },
+        { customerPhone: { $regex: phoneDigits, $options: 'i' } },
+      ],
+    })
+    const totalOrders = orders.length
+    const totalSpent = orders
+      .filter((o) => o.status !== 'cancelled')
+      .reduce((s, o) => s + (o.totalAmount || 0), 0)
+    await Customer.findByIdAndUpdate(customer._id, { totalOrders, totalSpent })
+
+    res
+      .status(isNew ? 201 : 200)
+      .json({
+        success: true,
+        data: customer,
+        action: isNew ? 'created' : 'updated',
+        message: isNew ? 'Customer added' : 'Customer updated',
+      })
   } catch (err) {
     res.status(500).json({ success: false, message: err.message })
   }
@@ -314,107 +384,4 @@ router.post('/marketing-blast', adminAuth, async (req, res) => {
   }
 })
 
-// ── GET /api/customers/test-whatsapp — admin: verify WA config ──
-router.get('/test-whatsapp', adminAuth, async (req, res) => {
-  const pid = process.env.WHATSAPP_PHONE_NUMBER_ID
-  const token = process.env.WHATSAPP_ACCESS_TOKEN
-  const biz = process.env.BUSINESS_WHATSAPP
-  res.json({
-    success: true,
-    configured: !!(pid && token),
-    phoneNumberId: pid ? pid.slice(0, 6) + '...' : 'NOT SET',
-    accessToken: token ? token.slice(0, 10) + '...' : 'NOT SET',
-    businessWhatsapp: biz || 'NOT SET',
-    instructions:
-      !pid || !token
-        ? [
-            '1. Go to developers.facebook.com',
-            '2. Create App → Business type → Add WhatsApp product',
-            '3. Get Phone Number ID and Permanent Access Token',
-            '4. Add to your .env file and restart the server',
-          ]
-        : ['WhatsApp is configured ✅'],
-  })
-})
-
 module.exports = router
-
-// ── POST /api/customers/manual — admin adds/updates customer ──────
-router.post('/manual', adminAuth, async (req, res) => {
-  try {
-    const { name, phone, address, pincode, city } = req.body
-    if (!phone)
-      return res
-        .status(400)
-        .json({ success: false, message: 'Phone number required' })
-
-    // Normalize phone
-    const digits = phone.replace(/[^0-9]/g, '')
-    let normalized = digits
-    if (digits.length === 10) normalized = '91' + digits
-    else if (digits.length === 12 && digits.startsWith('91'))
-      normalized = digits
-    else
-      return res
-        .status(400)
-        .json({
-          success: false,
-          message: 'Invalid phone — enter 10-digit Indian number',
-        })
-
-    // Upsert: if phone exists update name, else create
-    let customer = await Customer.findOne({ phone: normalized })
-    let isNew = false
-
-    if (customer) {
-      // Update name if provided
-      if (name && name.trim()) customer.name = name.trim()
-      // Add address if provided
-      if (address && pincode) {
-        const exists = customer.addresses.some(
-          (a) => a.address === address.trim(),
-        )
-        if (!exists) {
-          customer.addresses.push({
-            label: 'Home',
-            address: address.trim(),
-            pincode: pincode.trim(),
-            city: city || '',
-            isDefault: customer.addresses.length === 0,
-          })
-        }
-      }
-      await customer.save()
-    } else {
-      isNew = true
-      const newData = {
-        phone: normalized,
-        name: name?.trim() || '',
-        lastLogin: null,
-      }
-      if (address && pincode) {
-        newData.addresses = [
-          {
-            label: 'Home',
-            address: address.trim(),
-            pincode: pincode.trim(),
-            city: city || '',
-            isDefault: true,
-          },
-        ]
-      }
-      customer = await Customer.create(newData)
-    }
-
-    res.status(isNew ? 201 : 200).json({
-      success: true,
-      data: customer,
-      message: isNew
-        ? 'Customer added successfully'
-        : 'Customer updated successfully',
-      action: isNew ? 'created' : 'updated',
-    })
-  } catch (err) {
-    res.status(500).json({ success: false, message: err.message })
-  }
-})
